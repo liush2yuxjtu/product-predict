@@ -34,3 +34,4 @@ design.tar.gz
 /tmp/pp-*.log
 .agents/
 skills-lock.json
+.vercel
