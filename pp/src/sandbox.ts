@@ -139,7 +139,7 @@ async function waitForReady(
     }
 
     try {
-      const res = await fetch(readyUrl, { method: "GET" });
+      const res = await fetch(readyUrl, { method: "GET", signal: AbortSignal.timeout(1000) });
       if (res.status < 500) return;
       last = `HTTP ${res.status}`;
     } catch (e) {
@@ -155,11 +155,14 @@ async function waitForReady(
 async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
 
+  const ac = new AbortController();
   child.kill("SIGTERM");
-  const exited = once(child, "exit").then(() => undefined);
-  const killed = delay(5_000).then(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  });
+  const exited = once(child, "exit").then(() => ac.abort());
+  const killed = delay(5_000, undefined, { signal: ac.signal })
+    .then(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    })
+    .catch(() => {});
   await Promise.race([exited, killed]);
 }
 
@@ -189,6 +192,9 @@ function hasCommandPlaceholder(template: string): boolean {
 }
 
 function shellQuote(value: string): string {
+  if (process.platform === "win32") {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
