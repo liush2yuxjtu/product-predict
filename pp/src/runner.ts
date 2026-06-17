@@ -177,7 +177,7 @@ export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: 
     startedAt: t0,
     finishedAt,
     results,
-    ignoreRouteOrigin: sandboxOptions != null,
+    routeHostnames: sandboxOptions ? [sandboxOptions.host] : [],
   });
 
   const runJsonPath = join(runDir, "run.json");
@@ -210,7 +210,7 @@ function aggregate(args: {
   startedAt: string;
   finishedAt: string;
   results: AgentResult[];
-  ignoreRouteOrigin?: boolean;
+  routeHostnames?: string[];
 }): Run {
   const { runId, targetUrl, targetTitle, viewport, personaSetId, startedAt, finishedAt, results } = args;
 
@@ -283,7 +283,7 @@ function aggregate(args: {
     .sort((a, b) => b.count - a.count);
 
   // Routes — collect any URL that was visited and bucket dwell.
-  const routesHeat = buildRoutesHeat(results, targetUrl, args.ignoreRouteOrigin ?? false);
+  const routesHeat = buildRoutesHeat(results, targetUrl, args.routeHostnames ?? []);
 
   // Sentiment curve — sample at percent-of-elapsed buckets.
   const sentimentCurve = buildSentimentCurve(activity);
@@ -426,8 +426,10 @@ function aggregateFeatures(results: AgentResult[]): FeatureFrequency[] {
     .sort((a, b) => b.hitRate - a.hitRate || b.totalAttempts - a.totalAttempts);
 }
 
-function buildRoutesHeat(results: AgentResult[], targetUrl: string, ignoreOrigin: boolean): RouteHeat[] {
+function buildRoutesHeat(results: AgentResult[], targetUrl: string, routeHostnames: string[]): RouteHeat[] {
   const base = new URL(targetUrl);
+  const sandboxMode = routeHostnames.length > 0;
+  const allowedHostnames = allowedRouteHostnames(base.hostname, routeHostnames);
   const map = new Map<string, { visits: number; dwell: number; drops: number }>();
   for (const r of results) {
     const visited: { path: string; tSec: number }[] = [];
@@ -435,7 +437,11 @@ function buildRoutesHeat(results: AgentResult[], targetUrl: string, ignoreOrigin
       if (!e.url) continue;
       try {
         const u = new URL(e.url);
-        if (!ignoreOrigin && u.origin !== base.origin) continue;
+        if (sandboxMode) {
+          if (!allowedHostnames.has(normalizeRouteHostname(u.hostname))) continue;
+        } else if (u.origin !== base.origin) {
+          continue;
+        }
         const path = u.pathname || "/";
         visited.push({ path, tSec: tToSec(e.t) });
       } catch {
@@ -462,6 +468,17 @@ function buildRoutesHeat(results: AgentResult[], targetUrl: string, ignoreOrigin
     }))
     .sort((a, b) => b.visits - a.visits)
     .slice(0, 8);
+}
+
+function allowedRouteHostnames(targetHostname: string, routeHostnames: string[]): Set<string> {
+  const allowed = new Set([normalizeRouteHostname(targetHostname)]);
+  for (const hostname of routeHostnames) allowed.add(normalizeRouteHostname(hostname));
+  return allowed;
+}
+
+function normalizeRouteHostname(hostname: string): string {
+  const h = hostname.toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" ? "localhost" : h;
 }
 
 function buildSentimentCurve(events: Event[]): { t: number; v: number }[] {
