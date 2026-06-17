@@ -18,6 +18,8 @@ const base: LocalSandboxOptions = {
   readyTimeoutMs: 10_000,
 };
 
+const quotedCwd = process.platform === "win32" ? '"/tmp/product app"' : "'/tmp/product app'";
+
 test("sandbox env is opt-in", () => {
   assert.equal(readLocalSandboxOptionsFromEnv({}), null);
 });
@@ -60,7 +62,7 @@ test("default sandbox-runtime command wraps the target command", () => {
 
   assert.equal(
     cmd,
-    "sandbox-runtime run --cwd '/tmp/product app' -- npm run dev -- --host 127.0.0.1 --port 39001"
+    `sandbox-runtime run --cwd ${quotedCwd} -- npm run dev -- --host 127.0.0.1 --port 39001`
   );
 });
 
@@ -72,7 +74,7 @@ test("runtime template can fully control sandbox invocation", () => {
 
   assert.equal(
     cmd,
-    "sandbox-runtime exec --workdir '/tmp/product app' --agent a02 -- npm run dev -- --host 127.0.0.1 --port 39002"
+    `sandbox-runtime exec --workdir ${quotedCwd} --agent a02 -- npm run dev -- --host 127.0.0.1 --port 39002`
   );
 });
 
