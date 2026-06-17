@@ -1,4 +1,5 @@
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
@@ -93,19 +94,18 @@ export async function startLocalSandbox(
       PP_SANDBOX_AGENT_ID: session.agentId,
     },
     shell: true,
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  const logStream = createWriteStream(logPath, { flags: "a" });
   let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   child.once("exit", (code, signal) => {
     exited = { code, signal };
+    logStream.end();
   });
-  child.stdout?.on("data", (buf: Buffer) => {
-    void appendFile(logPath, buf).catch(() => {});
-  });
-  child.stderr?.on("data", (buf: Buffer) => {
-    void appendFile(logPath, buf).catch(() => {});
-  });
+  child.stdout?.pipe(logStream, { end: false });
+  child.stderr?.pipe(logStream, { end: false });
 
   try {
     await waitForReady(readyUrl, options.readyTimeoutMs, () => exited);
@@ -140,6 +140,7 @@ async function waitForReady(
 
     try {
       const res = await fetch(readyUrl, { method: "GET", signal: AbortSignal.timeout(1000) });
+      await res.arrayBuffer();
       if (res.status < 500) return;
       last = `HTTP ${res.status}`;
     } catch (e) {
@@ -156,14 +157,31 @@ async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   const ac = new AbortController();
-  child.kill("SIGTERM");
+  terminateChildTree(child, "SIGTERM");
   const exited = once(child, "exit").then(() => ac.abort());
   const killed = delay(5_000, undefined, { signal: ac.signal })
     .then(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      if (child.exitCode === null && child.signalCode === null) terminateChildTree(child, "SIGKILL");
     })
     .catch(() => {});
   await Promise.race([exited, killed]);
+}
+
+function terminateChildTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (!child.pid) {
+    child.kill(signal);
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"], { stdio: "ignore", windowsHide: true });
+    } else {
+      process.kill(-child.pid, signal);
+    }
+  } catch {
+    child.kill(signal);
+  }
 }
 
 function expandTemplate(
