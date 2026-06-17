@@ -1,5 +1,5 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -100,10 +100,10 @@ export async function startLocalSandbox(
   child.once("exit", (code, signal) => {
     exited = { code, signal };
   });
-  child.stdout.on("data", (buf: Buffer) => {
+  child.stdout?.on("data", (buf: Buffer) => {
     void appendFile(logPath, buf).catch(() => {});
   });
-  child.stderr.on("data", (buf: Buffer) => {
+  child.stderr?.on("data", (buf: Buffer) => {
     void appendFile(logPath, buf).catch(() => {});
   });
 
@@ -152,7 +152,7 @@ async function waitForReady(
   throw new Error(`timed out after ${timeoutMs}ms (${last})`);
 }
 
-async function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   child.kill("SIGTERM");
