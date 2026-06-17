@@ -45,12 +45,17 @@ export function readLocalSandboxOptionsFromEnv(env: NodeJS.ProcessEnv = process.
     throw new Error("set both PP_SANDBOX_RUNTIME and PP_SANDBOX_COMMAND to enable local sandbox isolation");
   }
 
+  const portBase = positiveInt("PP_SANDBOX_PORT_BASE", env.PP_SANDBOX_PORT_BASE, 39_000);
+  if (portBase > 65_535) {
+    throw new Error("PP_SANDBOX_PORT_BASE must be a valid port (1-65535)");
+  }
+
   return {
     runtime,
     command,
     cwd: resolve(env.PP_SANDBOX_CWD || process.cwd()),
     host: trim(env.PP_SANDBOX_HOST) || "127.0.0.1",
-    portBase: positiveInt("PP_SANDBOX_PORT_BASE", env.PP_SANDBOX_PORT_BASE, 39_000),
+    portBase,
     readyPath: readyPath(env.PP_SANDBOX_READY_PATH || "/"),
     readyTimeoutMs: positiveInt("PP_SANDBOX_READY_TIMEOUT_MS", env.PP_SANDBOX_READY_TIMEOUT_MS, 30_000),
   };
@@ -102,6 +107,8 @@ export async function startLocalSandbox(
   let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   child.once("exit", (code, signal) => {
     exited = { code, signal };
+  });
+  child.once("close", () => {
     logStream.end();
   });
   child.stdout?.pipe(logStream, { end: false });
@@ -175,7 +182,7 @@ function terminateChildTree(child: ChildProcess, signal: NodeJS.Signals): void {
 
   try {
     if (process.platform === "win32") {
-      spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"], { stdio: "ignore", windowsHide: true });
+      spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
     } else {
       process.kill(-child.pid, signal);
     }
