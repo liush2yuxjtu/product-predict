@@ -8,6 +8,13 @@ import type { Run, Event, Issue, Delight, RouteHeat, PersonaSet, FeatureFrequenc
 import { allocateSlots } from "./personas.js";
 import { runAgent, type AgentResult } from "./agent.js";
 import { simKeyCount } from "./llm.js";
+import {
+  readLocalSandboxOptionsFromEnv,
+  sandboxTargetUrl,
+  startLocalSandbox,
+  type LocalSandboxInstance,
+  type LocalSandboxOptions,
+} from "./sandbox.js";
 
 export type RunOptions = {
   targetUrl: string;
@@ -19,12 +26,14 @@ export type RunOptions = {
   headless: boolean;
   viewport?: { w: number; h: number };
   concurrency?: number;
+  sandbox?: LocalSandboxOptions | false;
   log?: (line: string) => void;
 };
 
 export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: string }> {
   const viewport = opts.viewport ?? { w: 1280, h: 800 };
   const log = opts.log ?? (() => {});
+  const sandboxOptions = opts.sandbox === false ? null : opts.sandbox ?? readLocalSandboxOptionsFromEnv();
 
   await mkdir(opts.outDir, { recursive: true });
   const runId = await nextRunId(opts.outDir);
@@ -57,19 +66,47 @@ export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: 
   const t0 = new Date().toISOString();
 
   let targetTitle = opts.targetUrl;
-  try {
-    const probe = await browser.newContext({ viewport: { width: viewport.w, height: viewport.h } });
-    const p = await probe.newPage();
-    await p.goto(opts.targetUrl, { waitUntil: "domcontentloaded", timeout: 15_000 });
-    targetTitle = (await p.title()) || opts.targetUrl;
-    await probe.close();
-  } catch (e) {
-    log(`probe failed: ${(e as Error).message}`);
+  if (sandboxOptions) {
+    log(`  mode: local sandbox-runtime isolation · headless=${opts.headless}`);
+    try {
+      const probeSandbox = await startLocalSandbox(sandboxOptions, {
+        agentId: "probe",
+        runDir,
+        port: sandboxOptions.portBase,
+        log,
+      });
+      try {
+        const probe = await browser.newContext({ viewport: { width: viewport.w, height: viewport.h } });
+        const p = await probe.newPage();
+        await p.goto(sandboxTargetUrl(opts.targetUrl, probeSandbox.host, probeSandbox.port), {
+          waitUntil: "domcontentloaded",
+          timeout: 15_000,
+        });
+        targetTitle = (await p.title()) || opts.targetUrl;
+        await probe.close();
+      } finally {
+        await probeSandbox.stop().catch(() => {});
+      }
+    } catch (e) {
+      log(`probe failed: ${(e as Error).message}`);
+    }
+  } else {
+    try {
+      const probe = await browser.newContext({ viewport: { width: viewport.w, height: viewport.h } });
+      const p = await probe.newPage();
+      await p.goto(opts.targetUrl, { waitUntil: "domcontentloaded", timeout: 15_000 });
+      targetTitle = (await p.title()) || opts.targetUrl;
+      await probe.close();
+    } catch (e) {
+      log(`probe failed: ${(e as Error).message}`);
+    }
   }
 
   // Default to running all agents in parallel — sim pool is sized by sim
   // key count and each agent gets one Playwright context. User can throttle
   // via --concurrency if RAM is tight (each Chromium context ≈ 150 MB).
+  // When sandbox-runtime mode is enabled, each agent also gets a unique local
+  // sandbox process and port, so app state / filesystem writes are isolated.
   const concurrency = Math.max(1, opts.concurrency ?? personas.length);
   log(`  concurrency=${concurrency} (${opts.concurrency != null ? "user-set" : "default = all agents"})`);
   const results: AgentResult[] = [];
@@ -78,12 +115,24 @@ export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: 
     while (cursor < personas.length) {
       const i = cursor++;
       const persona = personas[i];
+      let sandbox: LocalSandboxInstance | null = null;
+      let targetUrl = opts.targetUrl;
       log(`  [${persona.id}] ${persona.name} starting`);
       try {
+        if (sandboxOptions) {
+          sandbox = await startLocalSandbox(sandboxOptions, {
+            agentId: persona.id,
+            runDir,
+            port: sandboxOptions.portBase + i + 1,
+            log,
+          });
+          targetUrl = sandboxTargetUrl(opts.targetUrl, sandbox.host, sandbox.port);
+        }
+
         const r = await runAgent({
           persona,
           browser,
-          targetUrl: opts.targetUrl,
+          targetUrl,
           maxSteps: opts.maxSteps,
           maxMinutes: opts.maxMinutes,
           runDir,
@@ -108,6 +157,10 @@ export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: 
           durationSec: 0,
           cost: { tokensIn: 0, tokensOut: 0, usd: 0 },
         });
+      } finally {
+        if (sandbox) {
+          await sandbox.stop().catch((e) => log(`  [${persona.id}] sandbox stop failed: ${(e as Error).message}`));
+        }
       }
     }
   });
@@ -124,6 +177,7 @@ export async function executeRun(opts: RunOptions): Promise<{ run: Run; runDir: 
     startedAt: t0,
     finishedAt,
     results,
+    ignoreRouteOrigin: sandboxOptions != null,
   });
 
   const runJsonPath = join(runDir, "run.json");
@@ -156,6 +210,7 @@ function aggregate(args: {
   startedAt: string;
   finishedAt: string;
   results: AgentResult[];
+  ignoreRouteOrigin?: boolean;
 }): Run {
   const { runId, targetUrl, targetTitle, viewport, personaSetId, startedAt, finishedAt, results } = args;
 
@@ -228,7 +283,7 @@ function aggregate(args: {
     .sort((a, b) => b.count - a.count);
 
   // Routes — collect any URL that was visited and bucket dwell.
-  const routesHeat = buildRoutesHeat(results, targetUrl);
+  const routesHeat = buildRoutesHeat(results, targetUrl, args.ignoreRouteOrigin ?? false);
 
   // Sentiment curve — sample at percent-of-elapsed buckets.
   const sentimentCurve = buildSentimentCurve(activity);
@@ -371,7 +426,7 @@ function aggregateFeatures(results: AgentResult[]): FeatureFrequency[] {
     .sort((a, b) => b.hitRate - a.hitRate || b.totalAttempts - a.totalAttempts);
 }
 
-function buildRoutesHeat(results: AgentResult[], targetUrl: string): RouteHeat[] {
+function buildRoutesHeat(results: AgentResult[], targetUrl: string, ignoreOrigin: boolean): RouteHeat[] {
   const base = new URL(targetUrl);
   const map = new Map<string, { visits: number; dwell: number; drops: number }>();
   for (const r of results) {
@@ -380,7 +435,7 @@ function buildRoutesHeat(results: AgentResult[], targetUrl: string): RouteHeat[]
       if (!e.url) continue;
       try {
         const u = new URL(e.url);
-        if (u.origin !== base.origin) continue;
+        if (!ignoreOrigin && u.origin !== base.origin) continue;
         const path = u.pathname || "/";
         visited.push({ path, tSec: tToSec(e.t) });
       } catch {
